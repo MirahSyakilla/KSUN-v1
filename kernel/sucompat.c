@@ -13,6 +13,11 @@
 #else
 #include <linux/sched.h>
 #endif
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+#include <linux/susfs_def.h>
+extern bool susfs_is_sus_su_hooks_enabled;
+extern bool ksu_devpts_hook;
+#endif
 
 #include "objsec.h"
 #include "allowlist.h"
@@ -25,31 +30,32 @@
 #define SH_PATH "/system/bin/sh"
 
 #ifndef CONFIG_KSU_KPROBES_HOOK
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+static bool ksu_sucompat_non_kp __read_mostly = false;
+#else
 static bool ksu_sucompat_non_kp __read_mostly = true;
+#endif
 #endif
 
 extern void escape_to_root();
 
-static void __user *userspace_stack_buffer(const void *d, size_t len)
-{
-	/* To avoid having to mmap a page in userspace, just write below the stack
-   * pointer. */
-	char __user *p = (void __user *)current_user_stack_pointer() - len;
+static const char sh_path[] = "/system/bin/sh";
+static const char ksud_path[] = KSUD_PATH;
+static const char su[] = SU_PATH;
 
+static inline void __user *userspace_stack_buffer(const void *d, size_t len)
+{
+	char __user *p = (void __user *)current_user_stack_pointer() - len;
 	return copy_to_user(p, d, len) ? NULL : p;
 }
 
-static char __user *sh_user_path(void)
+static inline char __user *sh_user_path(void)
 {
-	static const char sh_path[] = "/system/bin/sh";
-
 	return userspace_stack_buffer(sh_path, sizeof(sh_path));
 }
 
-static char __user *ksud_user_path(void)
+static inline char __user *ksud_user_path(void)
 {
-	static const char ksud_path[] = KSUD_PATH;
-
 	return userspace_stack_buffer(ksud_path, sizeof(ksud_path));
 }
 
@@ -58,18 +64,34 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 {
 	const char su[] = SU_PATH;
 
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (susfs_is_sus_su_hooks_enabled) {
+		goto continue_logic;
+	}
+#endif
+
 #ifndef CONFIG_KSU_KPROBES_HOOK
 	if (!ksu_sucompat_non_kp) {
 		return 0;
 	}
 #endif
 
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+continue_logic:
+	; 
+#endif
+
+	// Always check UID to hide su from non-root apps
 	if (!ksu_is_allow_uid(current_uid().val)) {
 		return 0;
 	}
 
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	char path[sizeof(su) + 1] = {0};
+#else
 	char path[sizeof(su) + 1];
 	memset(path, 0, sizeof(path));
+#endif
 	ksu_strncpy_from_user_nofault(path, *filename_user, sizeof(path));
 
 	if (unlikely(!memcmp(path, su, sizeof(su)))) {
@@ -80,15 +102,44 @@ int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode,
 	return 0;
 }
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 1, 0) && defined(CONFIG_KSU_SUSFS_SUS_SU)
+struct filename* susfs_ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags) {
+	struct filename *name = getname_flags(*filename_user, getname_statx_lookup_flags(*flags), NULL);
+
+	if (unlikely(IS_ERR(name) || name->name == NULL)) {
+		return name;
+	}
+
+	if (likely(memcmp(name->name, su, sizeof(su)))) {
+		return name;
+	}
+
+	const char sh[] = SH_PATH;
+	pr_info("vfs_fstatat su->sh!\n");
+	memcpy((void *)name->name, sh, sizeof(sh));
+	return name;
+}
+#endif
+
 int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 {
-	// const char sh[] = SH_PATH;
 	const char su[] = SU_PATH;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (susfs_is_sus_su_hooks_enabled) {
+		goto continue_logic;
+	}
+#endif
 
 #ifndef CONFIG_KSU_KPROBES_HOOK
 	if (!ksu_sucompat_non_kp){
 		return 0;
 	}
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+continue_logic:
+	;
 #endif
 
 	if (!ksu_is_allow_uid(current_uid().val)) {
@@ -99,12 +150,14 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 		return 0;
 	}
 
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	char path[sizeof(su) + 1] = {0};
+#else
 	char path[sizeof(su) + 1];
 	memset(path, 0, sizeof(path));
-// Remove this later!! we use syscall hook, so this will never happen!!!!!
+#endif
+
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 18, 0) && 0
-	// it becomes a `struct filename *` after 5.18
-	// https://elixir.bootlin.com/linux/v5.18/source/fs/stat.c#L216
 	const char sh[] = SH_PATH;
 	struct filename *filename = *((struct filename **)filename_user);
 	if (IS_ERR(filename)) {
@@ -126,19 +179,27 @@ int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags)
 	return 0;
 }
 
-// the call from execve_handler_pre won't provided correct value for __never_use_argument, use them after fix execve_handler_pre, keeping them for consistence for manually patched code
 int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 				 void *__never_use_argv, void *__never_use_envp,
 				 int *__never_use_flags)
 {
 	struct filename *filename;
-	const char sh[] = KSUD_PATH;
-	const char su[] = SU_PATH;
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (susfs_is_sus_su_hooks_enabled) {
+		goto continue_logic;
+	}
+#endif
 
 #ifndef CONFIG_KSU_KPROBES_HOOK
 	if (!ksu_sucompat_non_kp) {
 		return 0;
 	}
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+continue_logic:
+	;
 #endif
 
 	if (unlikely(!filename_ptr))
@@ -156,7 +217,7 @@ int ksu_handle_execveat_sucompat(int *fd, struct filename **filename_ptr,
 		return 0;
 
 	pr_info("do_execveat_common su found\n");
-	memcpy((void *)filename->name, sh, sizeof(sh));
+	memcpy((void *)filename->name, ksud_path, sizeof(ksud_path));
 
 	escape_to_root();
 
@@ -168,7 +229,17 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 			       int *__never_use_flags)
 {
 	const char su[] = SU_PATH;
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	char path[sizeof(su) + 1] = {0};
+#else
 	char path[sizeof(su) + 1];
+#endif
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (susfs_is_sus_su_hooks_enabled) {
+		goto continue_logic;
+	}
+#endif
 
 #ifndef CONFIG_KSU_KPROBES_HOOK
 	if (!ksu_sucompat_non_kp) {
@@ -176,10 +247,17 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 	}
 #endif
 
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+continue_logic:
+	;
+#endif
+
 	if (unlikely(!filename_user))
 		return 0;
 
+#ifndef CONFIG_KSU_SUSFS_SUS_SU
 	memset(path, 0, sizeof(path));
+#endif
 	ksu_strncpy_from_user_retry(path, *filename_user, sizeof(path));
 
 	if (likely(memcmp(path, su, sizeof(su))))
@@ -198,11 +276,35 @@ int ksu_handle_execve_sucompat(int *fd, const char __user **filename_user,
 
 int ksu_handle_devpts(struct inode *inode)
 {
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	if (ksu_devpts_hook) {
+		goto continue_logic;
+	}
+#endif
+
 #ifndef CONFIG_KSU_KPROBES_HOOK
 	if (!ksu_sucompat_non_kp) {
 		return 0;
 	}
 #endif
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+continue_logic:
+	;
+#endif
+
+	// [OPTIMIZATION] Check if SID is already set to avoid heavy work and freezes
+	if (ksu_devpts_sid) {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+		struct inode_security_struct *sec = selinux_inode(inode);
+#else
+		struct inode_security_struct *sec =
+			(struct inode_security_struct *)inode->i_security;
+#endif
+		if (sec && sec->sid == ksu_devpts_sid) {
+			return 0; // Already set, return early
+		}
+	}
 
 	if (!current->mm) {
 		return 0;
@@ -210,7 +312,6 @@ int ksu_handle_devpts(struct inode *inode)
 
 	uid_t uid = current_uid().val;
 	if (uid % 100000 < 10000) {
-		// not untrusted_app, ignore it
 		return 0;
 	}
 
@@ -312,7 +413,6 @@ static void destroy_kprobe(struct kprobe **kp_ptr)
 static struct kprobe *su_kps[4];
 #endif
 
-// sucompat: permited process can execute 'su' to gain root access.
 void ksu_sucompat_init()
 {
 #ifdef CONFIG_KSU_KPROBES_HOOK
@@ -321,8 +421,12 @@ void ksu_sucompat_init()
 	su_kps[2] = init_kprobe(SYS_NEWFSTATAT_SYMBOL, newfstatat_handler_pre);
 	su_kps[3] = init_kprobe("pts_unix98_lookup", pts_unix98_lookup_pre);
 #else
+	#ifdef CONFIG_KSU_SUSFS_SUS_SU
+	ksu_sucompat_non_kp = false;
+	#else
 	ksu_sucompat_non_kp = true;
-	pr_info("ksu_sucompat_init: hooks enabled: execve/execveat_su, faccessat, stat, devpts\n");
+	#endif
+	pr_info("ksu_sucompat_init: hooks initialized\n");
 #endif
 }
 
@@ -338,3 +442,43 @@ void ksu_sucompat_exit()
 	pr_info("ksu_sucompat_exit: hooks disabled: execve/execveat_su, faccessat, stat, devpts\n");
 #endif
 }
+
+#ifdef CONFIG_KSU_SUSFS_SUS_SU
+extern bool ksu_su_compat_enabled;
+bool ksu_devpts_hook = true;
+bool susfs_is_sus_su_hooks_enabled __read_mostly = true;
+int susfs_sus_su_working_mode = SUS_SU_WITH_HOOKS;
+
+static bool ksu_is_su_kps_enabled(void) {
+#ifdef CONFIG_KSU_KPROBES_HOOK
+	for (int i = 0; i < ARRAY_SIZE(su_kps); i++) {
+		if (su_kps[i]) {
+			return true;
+		}
+	}
+	return false;
+#else
+	return ksu_sucompat_non_kp;
+#endif
+}
+
+void ksu_susfs_disable_sus_su(void) {
+	susfs_is_sus_su_hooks_enabled = false;
+	ksu_devpts_hook = false;
+	susfs_sus_su_working_mode = SUS_SU_DISABLED;
+	if (!ksu_is_su_kps_enabled()) {
+		ksu_sucompat_init();
+		ksu_su_compat_enabled = true;
+	}
+}
+
+void ksu_susfs_enable_sus_su(void) {
+	if (ksu_is_su_kps_enabled()) {
+		ksu_sucompat_exit();
+		ksu_su_compat_enabled = false;
+	}
+	susfs_is_sus_su_hooks_enabled = true;
+	ksu_devpts_hook = true;
+	susfs_sus_su_working_mode = SUS_SU_WITH_HOOKS;
+}
+#endif
